@@ -1,0 +1,89 @@
+name: 一加SM8750(sun)内核云编译
+on:
+  # 推送代码到v9分支时自动触发编译
+  push:
+    branches: [ "v9" ]
+  # 支持手动触发编译（无需提交代码，直接在页面点击即可编译）
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120 # 最大编译时长，防止超时中断
+    permissions:
+      contents: read
+
+    steps:
+      - name: 1. 拉取内核源码
+        uses: actions/checkout@v4
+        with:
+          ref: v9 # 适配你的仓库主分支
+          submodules: recursive # 自动同步子模块，解决编译依赖缺失问题
+          fetch-depth: 1 # 浅克隆，加快拉取速度
+
+      - name: 2. 安装系统编译依赖
+        run: |
+          sudo apt update
+          sudo apt install -y git build-essential bc bison flex libssl-dev libncurses-dev zip curl wget python3 cpio kmod gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi g++-arm-linux-gnueabi
+
+      - name: 3. 下载Android官方Clang编译工具链
+        run: |
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r1/clang-r487747b.tar.gz
+          mkdir -p $GITHUB_WORKSPACE/clang-host
+          tar -xzf clang-r487747b.tar.gz -C $GITHUB_WORKSPACE/clang-host
+          chmod +x $GITHUB_WORKSPACE/clang-host/bin/*
+
+      - name: 4. 配置编译环境变量
+        run: |
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/clang-host/bin:$PATH" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "READELF=llvm-readelf" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+
+      - name: 5. 加载内核默认配置
+        run: |
+          make O=out ARCH=arm64 gki_defconfig
+
+      - name: 6. 执行内核编译
+        run: |
+          make O=out -j$(nproc --all) 2>&1 | tee build.log
+
+      - name: 7. 打包AnyKernel3可刷入卡刷包
+        run: |
+          # 拉取AnyKernel3源码
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+
+          # 适配一加SM8750(sun)设备，自动修改配置
+          sed -i "s/device.name1=.*/device.name1=sun/g" anykernel.sh
+          sed -i "s/block=.*/block=\/dev\/block\/by-name\/boot/g" anykernel.sh
+          sed -i "s/is_slot_device=.*/is_slot_device=1/g" anykernel.sh
+          sed -i "s/ramdisk_compression=.*/ramdisk_compression=auto/g" anykernel.sh
+
+          # 复制编译产物
+          cp ../out/arch/arm64/boot/Image.gz .
+          cp ../out/arch/arm64/boot/dts/vendor/qcom/*.dtb dtbs/
+          cp -r ../out/modules/lib/modules/* modules/
+          [ -f ../out/arch/arm64/boot/dtbo.img ] && cp ../out/arch/arm64/boot/dtbo.img .
+
+          # 打包为卡刷包
+          zip -r ../OnePlus-SM8750-sun-Custom-Kernel.zip *
+          cd ..
+
+      - name: 8. 上传编译产物与日志
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus-SM8750-sun-内核卡刷包
+          path: |
+            OnePlus-SM8750-sun-Custom-Kernel.zip
+            build.log
+          retention-days: 90 # 产物保留90天
