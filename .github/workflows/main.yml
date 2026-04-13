@@ -1,88 +1,116 @@
-name: 一加SM8750(sun)内核云编译
+name: Build ReSUKI-SU Kernel with SUSFS (yastonc/sm8750)
+
 on:
-  # 推送代码到6.6-final分支时自动触发编译
-  push:
-    branches: [ "6.6-final" ]
-  # 支持手动触发编译
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+env:
+  DEVICE: oneplus13
+  DEFCONFIG: oneplus_sm8750_defconfig        # ← 关键：使用 yastonc 的 defconfig
+  RAMDISK_PATH: assets/ramdisk-oneplus13.img
 
 jobs:
-  build-kernel:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: read
-
+  build:
+    runs-on: ubuntu-22.04
     steps:
-      - name: 1. 拉取内核源码
+      - name: Checkout kernel source
         uses: actions/checkout@v4
-        with:
-          ref: 6.6-final # 修正为仓库实际存在的主分支
-          submodules: recursive # 自动同步子模块，解决依赖缺失问题
-          fetch-depth: 0 # 完整拉取分支，避免浅克隆导致的fetch报错
 
-      - name: 2. 安装系统编译依赖
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y git build-essential bc bison flex libssl-dev libncurses-dev zip curl wget python3 cpio kmod gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi g++-arm-linux-gnueabi
+          sudo apt install -y bc bison build-essential ccache curl flex \
+            git libncurses-dev libssl-dev python3 wget xz-utils pigz rsync
 
-      - name: 3. 下载Android官方Clang编译工具链
+      - name: Setup Rust (for ksud)
         run: |
-          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r1/clang-r487747b.tar.gz
-          mkdir -p $GITHUB_WORKSPACE/clang-host
-          tar -xzf clang-r487747b.tar.gz -C $GITHUB_WORKSPACE/clang-host
-          chmod +x $GITHUB_WORKSPACE/clang-host/bin/*
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source ~/.cargo/env
+          rustup target add aarch64-linux-android
 
-      - name: 4. 配置编译环境变量
+      - name: Download AOSP Clang (android14-release)
         run: |
-          echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "SUBARCH=arm64" >> $GITHUB_ENV
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
-          echo "PATH=$GITHUB_WORKSPACE/clang-host/bin:$PATH" >> $GITHUB_ENV
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "LD=ld.lld" >> $GITHUB_ENV
-          echo "AR=llvm-ar" >> $GITHUB_ENV
-          echo "NM=llvm-nm" >> $GITHUB_ENV
-          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
-          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
-          echo "READELF=llvm-readelf" >> $GITHUB_ENV
-          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          mkdir -p prebuilts/clang/host/linux-x86
+          cd prebuilts/clang/host/linux-x86
+          git clone -b android14-release --depth=1 \
+            https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/platform/prebuilts/clang/host/linux-x86 clang
 
-      - name: 5. 加载内核默认配置
+      - name: Integrate ReSUKI-SU (with SUSFS support)
         run: |
-          make O=out ARCH=arm64 gki_defconfig
+          # 使用 ReSUKI 官方 KernelSU（含 SUSFS）
+          curl -LSs "https://raw.githubusercontent.com/ReSUKI-dev/KernelSU/main/kernel/setup.sh" | bash -
 
-      - name: 6. 执行内核编译
+      - name: Enable SUSFS in defconfig
         run: |
-          make O=out -j$(nproc --all) 2>&1 | tee build.log
+          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} <<EOF
 
-      - name: 7. 打包AnyKernel3可刷入卡刷包
+# ReSUKI-SU + SUSFS Configuration
+CONFIG_KPROBES=y
+CONFIG_HAVE_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_KSU=y
+CONFIG_KSU_SUS=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=n
+CONFIG_KSU_MANUAL_HOOK=y
+CONFIG_LOCALVERSION_AUTO=n
+EOF
+
+      - name: Compile kernel (GKI-compatible)
         run: |
-          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git
-          cd AnyKernel3
+          export PATH=$GITHUB_WORKSPACE/prebuilts/clang/host/linux-x86/clang/bin:$PATH
+          export ARCH=arm64
+          export CC=clang
+          export LD=ld.lld
+          export LLVM_IAS=1
 
-          # 适配一加SM8750(sun)设备
-          sed -i "s/device.name1=.*/device.name1=sun/g" anykernel.sh
-          sed -i "s/block=.*/block=\/dev\/block\/by-name\/boot/g" anykernel.sh
-          sed -i "s/is_slot_device=.*/is_slot_device=1/g" anykernel.sh
-          sed -i "s/ramdisk_compression=.*/ramdisk_compression=auto/g" anykernel.sh
+          # 使用 defconfig
+          make ${{ env.DEFCONFIG }}
 
-          # 复制编译产物，兼容路径
-          cp ../out/arch/arm64/boot/Image.gz . || cp ../out/arch/arm64/boot/Image .
-          cp -r ../out/arch/arm64/boot/dts/vendor/qcom/*.dtb dtbs/ 2>/dev/null || true
-          cp -r ../out/modules/lib/modules/* modules/ 2>/dev/null || true
-          [ -f ../out/arch/arm64/boot/dtbo.img ] && cp ../out/arch/arm64/boot/dtbo.img .
+          # 编译（启用 Thin LTO 加速）
+          make -j$(nproc) LLVM=1 LLVM_IAS=1 LTO=thin 2>&1 | tee build.log
 
-          # 打包卡刷包
-          zip -r ../OnePlus-SM8750-sun-Custom-Kernel.zip *
-          cd ..
+      - name: Verify kernel output
+        run: |
+          echo "🔍 Checking kernel image..."
+          if [ -f arch/arm64/boot/Image.gz-dtb ]; then
+            echo "✅ Found Image.gz-dtb"
+          elif [ -f arch/arm64/boot/Image.gz ]; then
+            echo "⚠️ Found Image.gz (no dtb), may need manual dtb merge"
+          else
+            echo "❌ No kernel image found!"
+            exit 1
+          fi
 
-      - name: 8. 上传编译产物与日志
+      - name: Pack boot.img (if ramdisk provided)
+        run: |
+          if [ -f "${{ env.RAMDISK_PATH }}" ]; then
+            echo "📦 Packing boot.img with ramdisk..."
+            pip3 install mkbootimg
+
+            mkbootimg \
+              --kernel arch/arm64/boot/Image.gz-dtb \
+              --ramdisk ${{ env.RAMDISK_PATH }} \
+              --cmdline "console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.memcg=1" \
+              --base 0x00000000 \
+              --pagesize 4096 \
+              --os_version 14 \
+              --os_patch_level 2025-04 \
+              --output boot-resukisu-${{ env.DEVICE }}.img
+
+            echo "✅ boot-resukisu-${{ env.DEVICE }}.img created!"
+          else
+            echo "⚠️ Ramdisk not found at ${{ env.RAMDISK_PATH }}, skipping boot.img."
+          fi
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OnePlus-SM8750-sun-内核卡刷包
+          name: resukisu-kernel-${{ env.DEVICE }}
           path: |
-            OnePlus-SM8750-sun-Custom-Kernel.zip
+            arch/arm64/boot/Image.gz-dtb
+            arch/arm64/boot/Image.gz
+            boot-resukisu-${{ env.DEVICE }}.img
             build.log
-          retention-days: 90
