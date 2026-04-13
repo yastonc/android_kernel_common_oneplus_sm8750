@@ -1,13 +1,13 @@
-name: Build ReSUKI-SU Kernel with SUSFS (yastonc/sm8750)
+name: Build ReSUKI-SU Kernel with SUSFS for sm8750
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 允许手动触发
   push:
     branches: [ main, master ]
 
 env:
   DEVICE: oneplus13
-  DEFCONFIG: oneplus_sm8750_defconfig        # ← 关键：使用 yastonc 的 defconfig
+  DEFCONFIG: oneplus_sm8750_defconfig
   RAMDISK_PATH: assets/ramdisk-oneplus13.img
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
       - name: Checkout kernel source
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt update
           sudo apt install -y bc bison build-essential ccache curl flex \
@@ -36,15 +36,13 @@ jobs:
           git clone -b android14-release --depth=1 \
             https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/platform/prebuilts/clang/host/linux-x86 clang
 
-      - name: Integrate ReSUKI-SU (with SUSFS support)
+      - name: Integrate ReSUKI-SU (KernelSU with SUSFS)
         run: |
-          # 使用 ReSUKI 官方 KernelSU（含 SUSFS）
           curl -LSs "https://raw.githubusercontent.com/ReSUKI-dev/KernelSU/main/kernel/setup.sh" | bash -
 
       - name: Enable SUSFS in defconfig
         run: |
-          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} <<EOF
-
+          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << EOF
 # ReSUKI-SU + SUSFS Configuration
 CONFIG_KPROBES=y
 CONFIG_HAVE_KPROBES=y
@@ -58,7 +56,7 @@ CONFIG_KSU_MANUAL_HOOK=y
 CONFIG_LOCALVERSION_AUTO=n
 EOF
 
-      - name: Compile kernel (GKI-compatible)
+      - name: Compile kernel (Clang + LTO)
         run: |
           export PATH=$GITHUB_WORKSPACE/prebuilts/clang/host/linux-x86/clang/bin:$PATH
           export ARCH=arm64
@@ -66,28 +64,24 @@ EOF
           export LD=ld.lld
           export LLVM_IAS=1
 
-          # 使用 defconfig
           make ${{ env.DEFCONFIG }}
-
-          # 编译（启用 Thin LTO 加速）
           make -j$(nproc) LLVM=1 LLVM_IAS=1 LTO=thin 2>&1 | tee build.log
 
-      - name: Verify kernel output
+      - name: Verify kernel image
         run: |
-          echo "🔍 Checking kernel image..."
           if [ -f arch/arm64/boot/Image.gz-dtb ]; then
-            echo "✅ Found Image.gz-dtb"
+            echo "✅ Kernel image found: Image.gz-dtb"
           elif [ -f arch/arm64/boot/Image.gz ]; then
-            echo "⚠️ Found Image.gz (no dtb), may need manual dtb merge"
+            echo "⚠️ Only Image.gz found (no dtb merged)"
           else
-            echo "❌ No kernel image found!"
+            echo "❌ No kernel image generated!"
             exit 1
           fi
 
-      - name: Pack boot.img (if ramdisk provided)
+      - name: Pack boot.img (if ramdisk exists)
         run: |
           if [ -f "${{ env.RAMDISK_PATH }}" ]; then
-            echo "📦 Packing boot.img with ramdisk..."
+            echo "📦 Packing boot-resukisu-${{ env.DEVICE }}.img..."
             pip3 install mkbootimg
 
             mkbootimg \
@@ -100,7 +94,7 @@ EOF
               --os_patch_level 2025-04 \
               --output boot-resukisu-${{ env.DEVICE }}.img
 
-            echo "✅ boot-resukisu-${{ env.DEVICE }}.img created!"
+            echo "✅ boot-resukisu-${{ env.DEVICE }}.img ready!"
           else
             echo "⚠️ Ramdisk not found at ${{ env.RAMDISK_PATH }}, skipping boot.img."
           fi
